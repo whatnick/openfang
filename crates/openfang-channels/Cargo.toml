@@ -14,6 +14,7 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+prost = { workspace = true }
 reqwest = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
@@ -24,8 +25,14 @@ zeroize = { workspace = true }
 axum = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
+aes = "0.8"
+cbc = "0.1"
 base64 = { workspace = true }
 hex = { workspace = true }
+html-escape = { workspace = true }
+regex-lite = "0.1"
+roxmltree = "0.21"
 
 lettre = { workspace = true }
 imap = { workspace = true }
@@ -33,6 +40,7 @@ rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pki-types = { workspace = true }
 mailparse = { workspace = true }
+rumqttc = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

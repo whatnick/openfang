@@ -38,9 +38,17 @@ pub struct RepairStats {
 /// 1. Drops orphaned ToolResult blocks that have no matching ToolUse
 /// 2. Drops empty messages
 ///    - 2b. Reorders misplaced ToolResults to follow their matching ToolUse
-///    - 2c. Inserts synthetic error results for unmatched ToolUse blocks
-///    - 2d. Deduplicates ToolResults with the same tool_use_id
+///    - 2c. Deduplicates ToolResults with the same tool_use_id
+///    - 2d. Inserts synthetic error results for unmatched ToolUse blocks
 /// 3. Merges consecutive same-role messages
+///
+/// Note: dedup MUST run before synthetic insertion. Some providers (e.g., Moonshot)
+/// reuse `tool_use_id` values across turns (`function_name:index` format). After
+/// compaction, multiple ToolUse blocks may share the same id with only one matching
+/// ToolResult. If synthetic insertion ran first it would see the id as "matched" and
+/// skip it; dedup would then leave one ToolUse orphaned. By deduping first, we
+/// guarantee that each unique id has at most one result, and synthetic insertion
+/// can correctly count uses vs. results to top up missing pairings.
 pub fn validate_and_repair(messages: &[Message]) -> Vec<Message> {
     validate_and_repair_with_stats(messages).0
 }
@@ -117,13 +125,24 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
     let reordered_count = reorder_tool_results(&mut cleaned);
     stats.results_reordered = reordered_count;
 
-    // Phase 2c: Insert synthetic error results for unmatched ToolUse blocks
-    let synthetic_count = insert_synthetic_results(&mut cleaned);
-    stats.synthetic_results_inserted = synthetic_count;
-
-    // Phase 2d: Deduplicate ToolResults
+    // Phase 2c: Deduplicate ToolResults FIRST.
+    //
+    // This must run before synthetic insertion (issue #1013). Providers like
+    // Moonshot reuse tool_use_ids across turns in `function_name:index` form
+    // (e.g. "memory_store:0"). After compaction we may have multiple ToolUse
+    // blocks sharing the same id with multiple ToolResult blocks for the same
+    // id. If synthetic insertion ran first, it would see the id as "matched"
+    // and not insert any synthetic. Dedup would then strip the duplicate
+    // result, leaving a ToolUse orphaned and producing an API 400.
+    // Dedup only removes duplicate ToolResult blocks; ToolUse blocks are
+    // untouched, so the next phase can pair any leftover orphaned ToolUses
+    // with synthetic results.
     let dedup_count = deduplicate_tool_results(&mut cleaned);
     stats.duplicates_removed = dedup_count;
+
+    // Phase 2d: Insert synthetic error results for unmatched ToolUse blocks.
+    let synthetic_count = insert_synthetic_results(&mut cleaned);
+    stats.synthetic_results_inserted = synthetic_count;
 
     // Phase 2e: Skip aborted/errored assistant messages
     // An assistant message with no content blocks (or only empty text) followed by
@@ -175,6 +194,33 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
     }
 
     (merged, stats)
+}
+
+/// Ensure the message history starts with a user turn.
+///
+/// After context trimming the drain boundary may land on an assistant turn,
+/// leaving it at position 0. Providers (especially Gemini) require the first
+/// message to be from the user. This function drops leading assistant messages
+/// and re-validates to clean up newly-orphaned ToolResults.
+///
+/// The loop handles the edge case where the first user turn consisted entirely
+/// of ToolResult blocks that became orphaned (dropped by `validate_and_repair`),
+/// which would re-expose another leading assistant turn.
+pub fn ensure_starts_with_user(mut messages: Vec<Message>) -> Vec<Message> {
+    loop {
+        match messages.iter().position(|m| m.role == Role::User) {
+            Some(0) | None => break,
+            Some(i) => {
+                warn!(
+                    dropped = i,
+                    "Dropping leading assistant turn(s) to ensure history starts with user"
+                );
+                messages.drain(..i);
+                messages = validate_and_repair(&messages);
+            }
+        }
+    }
+    messages
 }
 
 /// Phase 2b: Reorder misplaced ToolResults -- ensure each result follows its use.
@@ -319,35 +365,44 @@ fn reorder_tool_results(messages: &mut Vec<Message>) -> usize {
     reorder_count
 }
 
-/// Phase 2c: Insert synthetic error results for unmatched ToolUse blocks.
+/// Phase 2d: Insert synthetic error results for unmatched ToolUse blocks.
 ///
 /// If an assistant message contains a ToolUse block but there is no matching
 /// ToolResult anywhere in the history, a synthetic error result is inserted
 /// immediately after the assistant message to prevent API validation errors.
+///
+/// This counts ToolUse and ToolResult occurrences per id (not just presence)
+/// so it correctly handles providers like Moonshot that reuse tool_use_ids
+/// across turns (e.g. "memory_store:0" called multiple times). If two ToolUses
+/// share an id but only one ToolResult exists, one synthetic will be inserted
+/// for the still-orphaned use.
 fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
-    // Collect all existing ToolResult IDs
-    let existing_result_ids: HashSet<String> = messages
-        .iter()
-        .flat_map(|m| match &m.content {
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            _ => vec![],
-        })
-        .collect();
+    // Count existing ToolResult IDs (occurrences, not just presence).
+    let mut available_result_counts: HashMap<String, usize> = HashMap::new();
+    for msg in messages.iter() {
+        if let MessageContent::Blocks(blocks) = &msg.content {
+            for b in blocks {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                    *available_result_counts
+                        .entry(tool_use_id.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
 
-    // Find ToolUse blocks without matching results
+    // Walk ToolUse blocks in order; consume one available result per id and
+    // mark any leftover ToolUses as orphaned.
     let mut orphaned_uses: Vec<(usize, String)> = Vec::new(); // (assistant_msg_idx, tool_use_id)
     for (idx, msg) in messages.iter().enumerate() {
         if msg.role == Role::Assistant {
             if let MessageContent::Blocks(blocks) = &msg.content {
                 for block in blocks {
                     if let ContentBlock::ToolUse { id, .. } = block {
-                        if !existing_result_ids.contains(id) {
+                        let remaining = available_result_counts.entry(id.clone()).or_insert(0);
+                        if *remaining > 0 {
+                            *remaining -= 1;
+                        } else {
                             orphaned_uses.push((idx, id.clone()));
                         }
                     }
@@ -370,6 +425,7 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
             .or_default()
             .push(ContentBlock::ToolResult {
                 tool_use_id,
+                tool_name: String::new(),
                 content: "[Tool execution was interrupted or lost]".to_string(),
                 is_error: true,
             });
@@ -408,10 +464,15 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
     count
 }
 
-/// Phase 2d: Drop duplicate ToolResults for the same tool_use_id.
+/// Phase 2c: Drop duplicate ToolResults for the same tool_use_id.
 ///
 /// If multiple ToolResult blocks exist for the same tool_use_id across the
 /// message history, only the first one is kept. Returns the count of duplicates removed.
+///
+/// Note: this only removes duplicate ToolResult blocks. ToolUse blocks are
+/// untouched, so the subsequent synthetic-insertion phase can pair any
+/// orphaned ToolUses (e.g. from Moonshot's repeated tool_use_ids) with
+/// synthetic results.
 fn deduplicate_tool_results(messages: &mut Vec<Message>) -> usize {
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut removed = 0usize;
@@ -491,7 +552,7 @@ fn is_empty_or_blank_content(content: &MessageContent) -> bool {
         MessageContent::Blocks(blocks) => {
             blocks.is_empty()
                 || blocks.iter().all(|b| match b {
-                    ContentBlock::Text { text } => text.trim().is_empty(),
+                    ContentBlock::Text { text, .. } => text.trim().is_empty(),
                     ContentBlock::Unknown => true,
                     _ => false,
                 })
@@ -629,7 +690,7 @@ pub fn prune_heartbeat_turns(messages: &mut Vec<Message>, keep_recent: usize) {
                 }
                 MessageContent::Blocks(blocks) => {
                     blocks.len() == 1
-                        && matches!(&blocks[0], ContentBlock::Text { text } if {
+                        && matches!(&blocks[0], ContentBlock::Text { text, .. } if {
                             let t = text.trim();
                             t == "NO_REPLY" || t == "[no reply needed]"
                         })
@@ -674,7 +735,10 @@ fn merge_content(dst: &mut MessageContent, src: MessageContent) {
 /// Convert MessageContent to a Vec<ContentBlock>.
 fn content_to_blocks(content: MessageContent) -> Vec<ContentBlock> {
     match content {
-        MessageContent::Text(s) => vec![ContentBlock::Text { text: s }],
+        MessageContent::Text(s) => vec![ContentBlock::Text {
+            text: s,
+            provider_metadata: None,
+        }],
         MessageContent::Blocks(blocks) => blocks,
     }
 }
@@ -702,6 +766,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "orphan-id".to_string(),
+                    tool_name: String::new(),
                     content: "some result".to_string(),
                     is_error: false,
                 }]),
@@ -756,12 +821,14 @@ mod tests {
                     id: "tu-1".to_string(),
                     name: "web_search".to_string(),
                     input: serde_json::json!({"query": "rust"}),
+                    provider_metadata: None,
                 }]),
             },
             Message {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-1".to_string(),
+                    tool_name: String::new(),
                     content: "Results found".to_string(),
                     is_error: false,
                 }]),
@@ -786,6 +853,7 @@ mod tests {
                     id: "tu-reorder".to_string(),
                     name: "web_search".to_string(),
                     input: serde_json::json!({"query": "rust"}),
+                    provider_metadata: None,
                 }]),
             },
             Message::user("While you search, I have another question"),
@@ -793,6 +861,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-reorder".to_string(),
+                    tool_name: String::new(),
                     content: "Search results".to_string(),
                     is_error: false,
                 }]),
@@ -838,6 +907,7 @@ mod tests {
                     id: "tu-orphan".to_string(),
                     name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/etc/hosts"}),
+                    provider_metadata: None,
                 }]),
             },
             Message::assistant("I tried to read the file"),
@@ -875,12 +945,14 @@ mod tests {
                     id: "tu-dup".to_string(),
                     name: "search".to_string(),
                     input: serde_json::json!({}),
+                    provider_metadata: None,
                 }]),
             },
             Message {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-dup".to_string(),
+                    tool_name: String::new(),
                     content: "First result".to_string(),
                     is_error: false,
                 }]),
@@ -889,6 +961,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-dup".to_string(),
+                    tool_name: String::new(),
                     content: "Duplicate result".to_string(),
                     is_error: false,
                 }]),
@@ -913,6 +986,152 @@ mod tests {
             })
             .sum();
         assert_eq!(result_count, 1, "Should keep only the first ToolResult");
+    }
+
+    #[test]
+    fn test_moonshot_duplicate_tool_ids_gets_synthetic_after_dedup_1013() {
+        // Regression for issue #1013.
+        //
+        // Moonshot returns tool_use_ids in `function_name:index` format
+        // (e.g. "memory_store:0") which repeat across turns when the same tool
+        // is called multiple times. After compaction we may keep multiple
+        // turns containing the same id. Phase ordering used to insert
+        // synthetic results BEFORE deduping, so duplicate-id ToolResults
+        // looked "matched" and dedup later stripped one, leaving an orphan
+        // and producing an API 400.
+        //
+        // After the fix, dedup runs first, then synthetic insertion counts
+        // ToolUse vs ToolResult occurrences per id and tops up the missing
+        // pairing.
+        let messages = vec![
+            Message::user("Remember this fact"),
+            // First turn: assistant calls memory_store with id "memory_store:0".
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "memory_store:0".to_string(),
+                    name: "memory_store".to_string(),
+                    input: serde_json::json!({"key": "fact1", "value": "hello"}),
+                    provider_metadata: None,
+                }]),
+            },
+            // Matching ToolResult for the first call.
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "memory_store:0".to_string(),
+                    tool_name: "memory_store".to_string(),
+                    content: "stored".to_string(),
+                    is_error: false,
+                }]),
+            },
+            // Second turn: assistant calls memory_store again with the SAME id
+            // because Moonshot reuses the `function_name:index` format.
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "memory_store:0".to_string(),
+                    name: "memory_store".to_string(),
+                    input: serde_json::json!({"key": "fact2", "value": "world"}),
+                    provider_metadata: None,
+                }]),
+            },
+            // No matching ToolResult for the second call (e.g. lost during
+            // compaction or interrupted mid-execution).
+            Message::user("Did it work?"),
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+
+        // Count ToolUse blocks and ToolResult blocks for "memory_store:0".
+        let mut tool_use_count = 0usize;
+        let mut tool_result_count = 0usize;
+        for m in &repaired {
+            if let MessageContent::Blocks(blocks) = &m.content {
+                for b in blocks {
+                    match b {
+                        ContentBlock::ToolUse { id, .. } if id == "memory_store:0" => {
+                            tool_use_count += 1;
+                        }
+                        ContentBlock::ToolResult { tool_use_id, .. }
+                            if tool_use_id == "memory_store:0" =>
+                        {
+                            tool_result_count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Both ToolUses must be preserved.
+        assert_eq!(
+            tool_use_count, 2,
+            "Both ToolUse blocks should be preserved after repair"
+        );
+        // Every ToolUse must have a corresponding ToolResult.
+        assert_eq!(
+            tool_result_count, tool_use_count,
+            "Every ToolUse should have exactly one corresponding ToolResult \
+             (uses={tool_use_count}, results={tool_result_count})"
+        );
+
+        // A synthetic result must have been inserted for the orphaned use.
+        assert_eq!(
+            stats.synthetic_results_inserted, 1,
+            "Exactly one synthetic result should be inserted for the orphaned ToolUse"
+        );
+
+        // No ToolResult should be orphaned (every ToolResult must have a
+        // matching ToolUse id).
+        let mut tool_use_ids: HashSet<String> = HashSet::new();
+        for m in &repaired {
+            if let MessageContent::Blocks(blocks) = &m.content {
+                for b in blocks {
+                    if let ContentBlock::ToolUse { id, .. } = b {
+                        tool_use_ids.insert(id.clone());
+                    }
+                }
+            }
+        }
+        for m in &repaired {
+            if let MessageContent::Blocks(blocks) = &m.content {
+                for b in blocks {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                        assert!(
+                            tool_use_ids.contains(tool_use_id),
+                            "ToolResult {tool_use_id} has no matching ToolUse"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Verify the synthetic result is marked as an error result and
+        // contains the interrupted-tool message.
+        let synthetic_present = repaired.iter().any(|m| {
+            if let MessageContent::Blocks(blocks) = &m.content {
+                blocks.iter().any(|b| match b {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error,
+                        content,
+                        ..
+                    } => {
+                        tool_use_id == "memory_store:0"
+                            && *is_error
+                            && content.contains("interrupted")
+                    }
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        });
+        assert!(
+            synthetic_present,
+            "A synthetic error ToolResult for memory_store:0 should be present"
+        );
     }
 
     #[test]
@@ -978,6 +1197,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "orphan".to_string(),
+                    tool_name: String::new(),
                     content: "lost".to_string(),
                     is_error: false,
                 }]),
@@ -1006,6 +1226,7 @@ mod tests {
                 role: Role::Assistant,
                 content: MessageContent::Blocks(vec![ContentBlock::Text {
                     text: String::new(),
+                    provider_metadata: None,
                 }]),
             },
             Message::user("Never mind"),
@@ -1044,11 +1265,13 @@ mod tests {
                         id: "tu-a".to_string(),
                         name: "search".to_string(),
                         input: serde_json::json!({}),
+                        provider_metadata: None,
                     },
                     ContentBlock::ToolUse {
                         id: "tu-b".to_string(),
                         name: "fetch".to_string(),
                         input: serde_json::json!({}),
+                        provider_metadata: None,
                     },
                 ]),
             },
@@ -1057,6 +1280,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-a".to_string(),
+                    tool_name: String::new(),
                     content: "search result".to_string(),
                     is_error: false,
                 }]),
@@ -1066,6 +1290,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-ghost".to_string(),
+                    tool_name: String::new(),
                     content: "ghost result".to_string(),
                     is_error: false,
                 }]),
@@ -1114,11 +1339,13 @@ mod tests {
                 content: MessageContent::Blocks(vec![
                     ContentBlock::ToolResult {
                         tool_use_id: "orphan-1".to_string(),
+                        tool_name: String::new(),
                         content: "lost 1".to_string(),
                         is_error: false,
                     },
                     ContentBlock::ToolResult {
                         tool_use_id: "orphan-2".to_string(),
+                        tool_name: String::new(),
                         content: "lost 2".to_string(),
                         is_error: false,
                     },

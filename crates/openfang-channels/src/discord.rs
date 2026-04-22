@@ -10,9 +10,11 @@ use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
@@ -33,12 +35,26 @@ mod opcode {
     pub const HEARTBEAT_ACK: u64 = 11;
 }
 
+/// Build a Discord gateway heartbeat (opcode 1) payload.
+///
+/// Per the Discord gateway spec, the payload `d` field is the last received
+/// dispatch sequence number, or `null` if no dispatch has been received yet.
+/// See: <https://discord.com/developers/docs/topics/gateway#sending-heartbeats>
+fn build_heartbeat_payload(last_sequence: Option<u64>) -> serde_json::Value {
+    serde_json::json!({
+        "op": opcode::HEARTBEAT,
+        "d": last_sequence,
+    })
+}
+
 /// Discord Gateway adapter using WebSocket.
 pub struct DiscordAdapter {
     /// SECURITY: Bot token is zeroized on drop to prevent memory disclosure.
     token: Zeroizing<String>,
     client: reqwest::Client,
-    allowed_guilds: Vec<u64>,
+    allowed_guilds: Vec<String>,
+    allowed_users: Vec<String>,
+    ignore_bots: bool,
     intents: u64,
     shutdown_tx: Arc<watch::Sender<bool>>,
     shutdown_rx: watch::Receiver<bool>,
@@ -51,12 +67,20 @@ pub struct DiscordAdapter {
 }
 
 impl DiscordAdapter {
-    pub fn new(token: String, allowed_guilds: Vec<u64>, intents: u64) -> Self {
+    pub fn new(
+        token: String,
+        allowed_guilds: Vec<String>,
+        allowed_users: Vec<String>,
+        ignore_bots: bool,
+        intents: u64,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             token: Zeroizing::new(token),
             client: reqwest::Client::new(),
             allowed_guilds,
+            allowed_users,
+            ignore_bots,
             intents,
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
@@ -147,6 +171,8 @@ impl ChannelAdapter for DiscordAdapter {
         let token = self.token.clone();
         let intents = self.intents;
         let allowed_guilds = self.allowed_guilds.clone();
+        let allowed_users = self.allowed_users.clone();
+        let ignore_bots = self.ignore_bots;
         let bot_user_id = self.bot_user_id.clone();
         let session_id_store = self.session_id.clone();
         let resume_url_store = self.resume_gateway_url.clone();
@@ -179,8 +205,15 @@ impl ChannelAdapter for DiscordAdapter {
                 backoff = INITIAL_BACKOFF;
                 info!("Discord gateway connected");
 
-                let (mut ws_tx, mut ws_rx) = ws_stream.split();
-                let mut _heartbeat_interval: Option<u64> = None;
+                let (ws_tx_raw, mut ws_rx) = ws_stream.split();
+                // Wrap the sink so the periodic heartbeat task and the inner
+                // loop can both write to it.
+                let ws_tx = Arc::new(Mutex::new(ws_tx_raw));
+                let mut heartbeat_handle: Option<JoinHandle<()>> = None;
+                // Tracks whether the most recent heartbeat we sent has been
+                // ACKed (opcode 11). Initialized to `true` so the first
+                // heartbeat is always allowed to fire.
+                let heartbeat_acked = Arc::new(AtomicBool::new(true));
 
                 // Inner message loop — returns true if we should reconnect
                 let should_reconnect = 'inner: loop {
@@ -189,7 +222,10 @@ impl ChannelAdapter for DiscordAdapter {
                         _ = shutdown.changed() => {
                             if *shutdown.borrow() {
                                 info!("Discord shutdown requested");
-                                let _ = ws_tx.close().await;
+                                if let Some(h) = heartbeat_handle.take() {
+                                    h.abort();
+                                }
+                                let _ = ws_tx.lock().await.close().await;
                                 return;
                             }
                             continue;
@@ -227,7 +263,8 @@ impl ChannelAdapter for DiscordAdapter {
 
                     let op = payload["op"].as_u64().unwrap_or(999);
 
-                    // Update sequence number
+                    // Update sequence number from any payload that carries one
+                    // (typically dispatch events, opcode 0).
                     if let Some(s) = payload["s"].as_u64() {
                         *sequence.write().await = Some(s);
                     }
@@ -236,8 +273,71 @@ impl ChannelAdapter for DiscordAdapter {
                         opcode::HELLO => {
                             let interval =
                                 payload["d"]["heartbeat_interval"].as_u64().unwrap_or(45000);
-                            _heartbeat_interval = Some(interval);
                             debug!("Discord HELLO: heartbeat_interval={interval}ms");
+
+                            // Spawn the periodic heartbeat task BEFORE we send
+                            // IDENTIFY/RESUME, per the Discord gateway flow.
+                            // Abort any stale handle from a previous attempt
+                            // first (defensive — should normally be None here).
+                            if let Some(h) = heartbeat_handle.take() {
+                                h.abort();
+                            }
+                            heartbeat_acked.store(true, Ordering::Relaxed);
+                            let hb_sink = ws_tx.clone();
+                            let hb_seq = sequence.clone();
+                            let hb_acked = heartbeat_acked.clone();
+                            let mut hb_shutdown = shutdown.clone();
+                            heartbeat_handle = Some(tokio::spawn(async move {
+                                let mut ticker =
+                                    tokio::time::interval(Duration::from_millis(interval));
+                                // Skip the immediate first tick — we want to
+                                // wait one full interval before the first beat.
+                                ticker.tick().await;
+                                loop {
+                                    tokio::select! {
+                                        _ = ticker.tick() => {}
+                                        _ = hb_shutdown.changed() => {
+                                            if *hb_shutdown.borrow() {
+                                                return;
+                                            }
+                                            continue;
+                                        }
+                                    }
+
+                                    // If the previous heartbeat was never
+                                    // ACKed, the connection is zombied — close
+                                    // the sink so the read loop sees EOF and
+                                    // triggers a reconnect (Discord spec).
+                                    if !hb_acked.swap(false, Ordering::Relaxed) {
+                                        warn!(
+                                            "Discord: previous heartbeat not ACKed, \
+                                             forcing reconnect"
+                                        );
+                                        let _ = hb_sink.lock().await.close().await;
+                                        return;
+                                    }
+
+                                    let seq = *hb_seq.read().await;
+                                    let payload = build_heartbeat_payload(seq);
+                                    let text = match serde_json::to_string(&payload) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            error!("Discord: failed to serialize heartbeat: {e}");
+                                            return;
+                                        }
+                                    };
+                                    let send_res = hb_sink
+                                        .lock()
+                                        .await
+                                        .send(tokio_tungstenite::tungstenite::Message::Text(text))
+                                        .await;
+                                    if let Err(e) = send_res {
+                                        warn!("Discord: failed to send heartbeat: {e}");
+                                        return;
+                                    }
+                                    debug!("Discord heartbeat sent (seq={:?})", seq);
+                                }
+                            }));
 
                             // Try RESUME if we have a session, otherwise IDENTIFY
                             let has_session = session_id_store.read().await.is_some();
@@ -272,6 +372,8 @@ impl ChannelAdapter for DiscordAdapter {
                             };
 
                             if let Err(e) = ws_tx
+                                .lock()
+                                .await
                                 .send(tokio_tungstenite::tungstenite::Message::Text(
                                     serde_json::to_string(&gateway_msg).unwrap(),
                                 ))
@@ -306,9 +408,14 @@ impl ChannelAdapter for DiscordAdapter {
                                 }
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
-                                    if let Some(msg) =
-                                        parse_discord_message(d, &bot_user_id, &allowed_guilds)
-                                            .await
+                                    if let Some(msg) = parse_discord_message(
+                                        d,
+                                        &bot_user_id,
+                                        &allowed_guilds,
+                                        &allowed_users,
+                                        ignore_bots,
+                                    )
+                                    .await
                                     {
                                         debug!(
                                             "Discord {event_name} from {}: {:?}",
@@ -333,16 +440,23 @@ impl ChannelAdapter for DiscordAdapter {
                         opcode::HEARTBEAT => {
                             // Server requests immediate heartbeat
                             let seq = *sequence.read().await;
-                            let hb = serde_json::json!({ "op": opcode::HEARTBEAT, "d": seq });
+                            let hb = build_heartbeat_payload(seq);
                             let _ = ws_tx
+                                .lock()
+                                .await
                                 .send(tokio_tungstenite::tungstenite::Message::Text(
                                     serde_json::to_string(&hb).unwrap(),
                                 ))
                                 .await;
+                            // The server-requested heartbeat counts as a fresh
+                            // beat — reset the ACK gate so the periodic task
+                            // doesn't see a stale "unacked" flag.
+                            heartbeat_acked.store(false, Ordering::Relaxed);
                         }
 
                         opcode::HEARTBEAT_ACK => {
                             debug!("Discord heartbeat ACK received");
+                            heartbeat_acked.store(true, Ordering::Relaxed);
                         }
 
                         opcode::RECONNECT => {
@@ -367,6 +481,12 @@ impl ChannelAdapter for DiscordAdapter {
                         }
                     }
                 };
+
+                // Tear down the heartbeat task before we either exit or
+                // reconnect, so it doesn't outlive its WebSocket sink.
+                if let Some(h) = heartbeat_handle.take() {
+                    h.abort();
+                }
 
                 if !should_reconnect || *shutdown.borrow() {
                     break;
@@ -422,7 +542,9 @@ impl ChannelAdapter for DiscordAdapter {
 async fn parse_discord_message(
     d: &serde_json::Value,
     bot_user_id: &Arc<RwLock<Option<String>>>,
-    allowed_guilds: &[u64],
+    allowed_guilds: &[String],
+    allowed_users: &[String],
+    ignore_bots: bool,
 ) -> Option<ChannelMessage> {
     let author = d.get("author")?;
     let author_id = author["id"].as_str()?;
@@ -434,16 +556,21 @@ async fn parse_discord_message(
         }
     }
 
-    // Filter out other bots
-    if author["bot"].as_bool() == Some(true) {
+    // Filter out other bots (configurable via ignore_bots)
+    if ignore_bots && author["bot"].as_bool() == Some(true) {
+        return None;
+    }
+
+    // Filter by allowed users
+    if !allowed_users.is_empty() && !allowed_users.iter().any(|u| u == author_id) {
+        debug!("Discord: ignoring message from unlisted user {author_id}");
         return None;
     }
 
     // Filter by allowed guilds
     if !allowed_guilds.is_empty() {
         if let Some(guild_id) = d["guild_id"].as_str() {
-            let gid: u64 = guild_id.parse().unwrap_or(0);
-            if !allowed_guilds.contains(&gid) {
+            if !allowed_guilds.iter().any(|g| g == guild_id) {
                 return None;
             }
         }
@@ -487,6 +614,29 @@ async fn parse_discord_message(
         ChannelContent::Text(content_text.to_string())
     };
 
+    // Determine if this is a group message (guild_id present = server channel)
+    let is_group = d["guild_id"].as_str().is_some();
+
+    // Check if bot was @mentioned (for MentionOnly policy enforcement)
+    let was_mentioned = if let Some(ref bid) = *bot_user_id.read().await {
+        // Check Discord mentions array
+        let mentioned_in_array = d["mentions"]
+            .as_array()
+            .map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(bid.as_str())))
+            .unwrap_or(false);
+        // Also check content for <@bot_id> or <@!bot_id> patterns
+        let mentioned_in_content = content_text.contains(&format!("<@{bid}>"))
+            || content_text.contains(&format!("<@!{bid}>"));
+        mentioned_in_array || mentioned_in_content
+    } else {
+        false
+    };
+
+    let mut metadata = HashMap::new();
+    if was_mentioned {
+        metadata.insert("was_mentioned".to_string(), serde_json::json!(true));
+    }
+
     Some(ChannelMessage {
         channel: ChannelType::Discord,
         platform_message_id: message_id.to_string(),
@@ -498,9 +648,9 @@ async fn parse_discord_message(
         content,
         target_agent: None,
         timestamp,
-        is_group: true,
+        is_group,
         thread_id: None,
-        metadata: HashMap::new(),
+        metadata,
     })
 }
 
@@ -524,7 +674,9 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+            .await
+            .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert_eq!(msg.sender.display_name, "alice");
         assert_eq!(msg.sender.platform_id, "ch1");
@@ -546,7 +698,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
         assert!(msg.is_none());
     }
 
@@ -566,7 +718,52 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        assert!(msg.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_ignore_bots_false_allows_other_bots() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "Bot message",
+            "author": {
+                "id": "other_bot",
+                "username": "somebot",
+                "discriminator": "0",
+                "bot": true
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        // With ignore_bots=false, other bots' messages should be allowed
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], false).await;
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+        assert_eq!(msg.sender.display_name, "somebot");
+        assert!(matches!(msg.content, ChannelContent::Text(ref t) if t == "Bot message"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_ignore_bots_false_still_filters_self() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "My own message",
+            "author": {
+                "id": "bot123",
+                "username": "openfang",
+                "discriminator": "0",
+                "bot": true
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        // Even with ignore_bots=false, the bot's own messages must still be filtered
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], false).await;
         assert!(msg.is_none());
     }
 
@@ -587,11 +784,12 @@ mod tests {
         });
 
         // Not in allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &[111, 222]).await;
+        let msg =
+            parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], true).await;
         assert!(msg.is_none());
 
         // In allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &[999]).await;
+        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], true).await;
         assert!(msg.is_some());
     }
 
@@ -610,7 +808,9 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+            .await
+            .unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -635,7 +835,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
         assert!(msg.is_none());
     }
 
@@ -654,7 +854,9 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+            .await
+            .unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
     }
 
@@ -676,16 +878,154 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[]).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+            .await
+            .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert!(
             matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message content")
         );
     }
 
+    #[tokio::test]
+    async fn test_parse_discord_allowed_users_filter() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "Hello",
+            "author": {
+                "id": "user999",
+                "username": "bob",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        // Not in allowed users
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &["user111".into(), "user222".into()],
+            true,
+        )
+        .await;
+        assert!(msg.is_none());
+
+        // In allowed users
+        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true).await;
+        assert!(msg.is_some());
+
+        // Empty allowed_users = allow all
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        assert!(msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_mention_detection() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+
+        // Message with bot mentioned in mentions array
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "guild_id": "guild1",
+            "content": "Hey <@bot123> help me",
+            "mentions": [{"id": "bot123", "username": "openfang"}],
+            "author": {
+                "id": "user1",
+                "username": "alice",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+            .await
+            .unwrap();
+        assert!(msg.is_group);
+        assert_eq!(
+            msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        // Message without mention in group
+        let d2 = serde_json::json!({
+            "id": "msg2",
+            "channel_id": "ch1",
+            "guild_id": "guild1",
+            "content": "Just chatting",
+            "author": {
+                "id": "user1",
+                "username": "alice",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true)
+            .await
+            .unwrap();
+        assert!(msg2.is_group);
+        assert!(!msg2.metadata.contains_key("was_mentioned"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_dm_not_group() {
+        let bot_id = Arc::new(RwLock::new(None));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "dm-ch1",
+            "content": "Hello",
+            "author": {
+                "id": "user1",
+                "username": "alice",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+            .await
+            .unwrap();
+        assert!(!msg.is_group);
+    }
+
+    #[test]
+    fn test_build_heartbeat_payload_with_sequence() {
+        let payload = build_heartbeat_payload(Some(42));
+        assert_eq!(payload["op"], 1);
+        assert_eq!(payload["d"], 42);
+        // Round-trip through serde_json::to_string and re-parse to assert
+        // valid JSON matching {"op":1,"d":42} regardless of key ordering.
+        let s = serde_json::to_string(&payload).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, serde_json::json!({"op": 1, "d": 42}));
+    }
+
+    #[test]
+    fn test_build_heartbeat_payload_without_sequence() {
+        let payload = build_heartbeat_payload(None);
+        assert_eq!(payload["op"], 1);
+        assert!(payload["d"].is_null());
+        let s = serde_json::to_string(&payload).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({"op": 1, "d": serde_json::Value::Null})
+        );
+    }
+
     #[test]
     fn test_discord_adapter_creation() {
-        let adapter = DiscordAdapter::new("test-token".to_string(), vec![123, 456], 33280);
+        let adapter = DiscordAdapter::new(
+            "test-token".to_string(),
+            vec!["123".to_string(), "456".to_string()],
+            vec![],
+            true,
+            37376,
+        );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
     }

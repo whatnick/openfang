@@ -343,7 +343,11 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                     if oversized {
                         let limit = config.max_chunk_chars / 4;
                         let truncated = if s.len() > limit {
-                            format!("{}...[truncated from {} chars]", safe_truncate_str(s, limit), s.len())
+                            format!(
+                                "{}...[truncated from {} chars]",
+                                safe_truncate_str(s, limit),
+                                s.len()
+                            )
                         } else {
                             s.clone()
                         };
@@ -356,7 +360,7 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
             MessageContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        ContentBlock::Text { text } => {
+                        ContentBlock::Text { text, .. } => {
                             if !text.is_empty() {
                                 if oversized && text.len() > config.max_chunk_chars / 4 {
                                     let limit = config.max_chunk_chars / 4;
@@ -426,8 +430,17 @@ async fn summarize_messages(
     let effective_max = (config.max_chunk_chars as f64 / config.safety_margin) as usize;
     if conversation_text.len() > effective_max {
         // Keep the tail (most recent) which is usually more important
-        conversation_text =
-            conversation_text[conversation_text.len() - effective_max..].to_string();
+        let start = conversation_text.len() - effective_max;
+        // Find valid char boundary at or after start
+        let safe_start = if conversation_text.is_char_boundary(start) {
+            start
+        } else {
+            // Find the nearest valid character boundary moving upward
+            (start..conversation_text.len())
+                .find(|&i| conversation_text.is_char_boundary(i))
+                .unwrap_or(conversation_text.len())
+        };
+        conversation_text = conversation_text[safe_start..].to_string();
     }
 
     let summarize_prompt = format!(
@@ -442,6 +455,7 @@ async fn summarize_messages(
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::Text {
                 text: summarize_prompt,
+                provider_metadata: None,
             }]),
         }],
         tools: vec![],
@@ -557,7 +571,10 @@ async fn summarize_in_chunks(
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::Text { text: merge_prompt }]),
+            content: MessageContent::Blocks(vec![ContentBlock::Text {
+                text: merge_prompt,
+                provider_metadata: None,
+            }]),
         }],
         tools: vec![],
         max_tokens: config.max_summary_tokens,
@@ -585,6 +602,49 @@ async fn summarize_in_chunks(
             // Fallback: just concatenate the chunk summaries
             Ok(summaries.join("\n\n"))
         }
+    }
+}
+
+/// Adjust a split index so it does not land between an assistant ToolUse message
+/// and the immediately following user ToolResult message.
+///
+/// If `split` points right after an assistant message that contains ToolUse blocks,
+/// and the message at `split` is a user message with matching ToolResult blocks,
+/// the split is pulled back by 1 so the pair stays in the "kept" portion.
+fn adjust_split_for_tool_pairs(messages: &[Message], split: usize) -> usize {
+    use openfang_types::message::{ContentBlock, Role};
+
+    if split == 0 || split >= messages.len() {
+        return split;
+    }
+
+    // Check if split - 1 is an assistant with ToolUse and split is a user with ToolResult
+    let prev = &messages[split - 1];
+    let curr = &messages[split];
+
+    if prev.role != Role::Assistant || curr.role != Role::User {
+        return split;
+    }
+
+    let prev_has_tool_use = match &prev.content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+        _ => false,
+    };
+
+    let curr_has_tool_result = match &curr.content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+        _ => false,
+    };
+
+    if prev_has_tool_use && curr_has_tool_result {
+        // Pull back so both stay in "kept"
+        split - 1
+    } else {
+        split
     }
 }
 
@@ -616,7 +676,11 @@ pub async fn compact_session(
         });
     }
 
-    let split_at = msg_count.saturating_sub(config.keep_recent);
+    let raw_split = msg_count.saturating_sub(config.keep_recent);
+    // Adjust split point to avoid cutting between a ToolUse assistant message
+    // and its ToolResult user message.  If the split lands right between them,
+    // pull back by 1 so the pair stays together in `kept`.
+    let split_at = adjust_split_for_tool_pairs(&session.messages, raw_split);
     let to_compact = &session.messages[..split_at];
     let kept = &session.messages[split_at..];
 
@@ -760,6 +824,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Summary of conversation".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: openfang_types::message::StopReason::EndTurn,
                     tool_calls: vec![],
@@ -821,6 +886,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Summary with tools".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: openfang_types::message::StopReason::EndTurn,
                     tool_calls: vec![],
@@ -844,12 +910,14 @@ mod tests {
                 id: "tu-1".to_string(),
                 name: "web_search".to_string(),
                 input: serde_json::json!({"query": "test"}),
+                provider_metadata: None,
             }]),
         };
         messages[2] = Message {
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "tu-1".to_string(),
+                tool_name: String::new(),
                 content: "Search results here".to_string(),
                 is_error: false,
             }]),
@@ -911,6 +979,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Summary: discussed topics 0 through 79".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: openfang_types::message::StopReason::EndTurn,
                     tool_calls: vec![],
@@ -1106,6 +1175,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: format!("Chunk summary {n}"),
+                        provider_metadata: None,
                     }],
                     stop_reason: openfang_types::message::StopReason::EndTurn,
                     tool_calls: vec![],
@@ -1172,11 +1242,13 @@ mod tests {
                 content: MessageContent::Blocks(vec![
                     ContentBlock::Text {
                         text: "Let me search".to_string(),
+                        provider_metadata: None,
                     },
                     ContentBlock::ToolUse {
                         id: "tu-1".to_string(),
                         name: "web_search".to_string(),
                         input: serde_json::json!({"query": "rust"}),
+                        provider_metadata: None,
                     },
                 ]),
             },
@@ -1184,6 +1256,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "tu-1".to_string(),
+                    tool_name: String::new(),
                     content: "Results found".to_string(),
                     is_error: false,
                 }]),
@@ -1219,7 +1292,7 @@ mod tests {
         assert!(
             text.contains("truncated from"),
             "Oversized message should be truncated, got: {}",
-            &text[..text.len().min(200)]
+            crate::str_utils::safe_truncate_str(&text, 200)
         );
     }
 
@@ -1324,6 +1397,7 @@ mod tests {
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "t1".to_string(),
+                tool_name: String::new(),
                 content: tool_content,
                 is_error: false,
             }]),
@@ -1343,6 +1417,7 @@ mod tests {
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "t2".to_string(),
+                tool_name: String::new(),
                 content: large_result,
                 is_error: false,
             }]),
@@ -1366,11 +1441,67 @@ mod tests {
             role: Role::User,
             content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "t3".to_string(),
+                tool_name: String::new(),
                 content: short_result.to_string(),
                 is_error: false,
             }]),
         }];
         let text = build_conversation_text(&messages, &config);
         assert!(text.contains(short_result));
+    }
+
+    #[test]
+    fn test_adjust_split_pulls_back_for_tool_pair() {
+        // Messages: [user, assistant(ToolUse), user(ToolResult), assistant("done")]
+        // Split at 2 would separate the ToolUse from its ToolResult.
+        let messages = vec![
+            Message::user("hello"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    tool_name: "read".to_string(),
+                    content: "file contents".to_string(),
+                    is_error: false,
+                }]),
+            },
+            Message::assistant("Done reading."),
+        ];
+        let adjusted = adjust_split_for_tool_pairs(&messages, 2);
+        assert_eq!(
+            adjusted, 1,
+            "Should pull back split to keep ToolUse + ToolResult together"
+        );
+    }
+
+    #[test]
+    fn test_adjust_split_no_change_for_text() {
+        let messages = vec![
+            Message::user("a"),
+            Message::assistant("b"),
+            Message::user("c"),
+        ];
+        let adjusted = adjust_split_for_tool_pairs(&messages, 1);
+        assert_eq!(
+            adjusted, 1,
+            "Should not change split for plain text messages"
+        );
+    }
+
+    #[test]
+    fn test_adjust_split_edge_cases() {
+        let messages = vec![Message::user("a")];
+        assert_eq!(adjust_split_for_tool_pairs(&messages, 0), 0);
+        assert_eq!(adjust_split_for_tool_pairs(&messages, 1), 1);
+        assert_eq!(adjust_split_for_tool_pairs(&messages, 5), 5);
     }
 }

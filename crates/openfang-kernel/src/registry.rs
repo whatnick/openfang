@@ -177,6 +177,42 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Update an agent's model, provider, and connection hints together.
+    pub fn update_model_provider_config(
+        &self,
+        id: AgentId,
+        new_model: String,
+        new_provider: String,
+        api_key_env: Option<String>,
+        base_url: Option<String>,
+    ) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.model.model = new_model;
+        entry.manifest.model.provider = new_provider;
+        entry.manifest.model.api_key_env = api_key_env;
+        entry.manifest.model.base_url = base_url;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Update an agent's fallback model chain.
+    pub fn update_fallback_models(
+        &self,
+        id: AgentId,
+        fallback_models: Vec<openfang_types::agent::FallbackModel>,
+    ) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.fallback_models = fallback_models;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Update an agent's skill allowlist.
     pub fn update_skills(&self, id: AgentId, skills: Vec<String>) -> OpenFangResult<()> {
         let mut entry = self
@@ -199,6 +235,35 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Update an agent's tool allowlist and blocklist.
+    pub fn update_tool_filters(
+        &self,
+        id: AgentId,
+        allowlist: Option<Vec<String>>,
+        blocklist: Option<Vec<String>>,
+    ) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        if let Some(al) = allowlist {
+            entry.manifest.tool_allowlist = al;
+        }
+        if let Some(bl) = blocklist {
+            entry.manifest.tool_blocklist = bl;
+        }
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Touch an agent — refresh last_active without changing any other state.
+    /// Used by the agent loop to prevent heartbeat false-positives during long LLM calls.
+    pub fn touch(&self, id: AgentId) {
+        if let Some(mut entry) = self.agents.get_mut(&id) {
+            entry.last_active = chrono::Utc::now();
+        }
+    }
+
     /// Update an agent's system prompt (hot-swap, takes effect on next message).
     pub fn update_system_prompt(&self, id: AgentId, new_prompt: String) -> OpenFangResult<()> {
         let mut entry = self
@@ -212,8 +277,12 @@ impl AgentRegistry {
 
     /// Update an agent's name (also updates the name index).
     pub fn update_name(&self, id: AgentId, new_name: String) -> OpenFangResult<()> {
-        if self.name_index.contains_key(&new_name) {
-            return Err(OpenFangError::AgentAlreadyExists(new_name));
+        if let Some(existing_id) = self.name_index.get(&new_name).as_deref().copied() {
+            if existing_id != id {
+                return Err(OpenFangError::AgentAlreadyExists(new_name));
+            }
+            // Same agent owns this name — no-op
+            return Ok(());
         }
         let mut entry = self
             .agents
@@ -237,6 +306,35 @@ impl AgentRegistry {
             .get_mut(&id)
             .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
         entry.manifest.description = new_desc;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Update an agent's resource quota (budget limits).
+    pub fn update_resources(
+        &self,
+        id: AgentId,
+        hourly: Option<f64>,
+        daily: Option<f64>,
+        monthly: Option<f64>,
+        tokens_per_hour: Option<u64>,
+    ) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        if let Some(v) = hourly {
+            entry.manifest.resources.max_cost_per_hour_usd = v;
+        }
+        if let Some(v) = daily {
+            entry.manifest.resources.max_cost_per_day_usd = v;
+        }
+        if let Some(v) = monthly {
+            entry.manifest.resources.max_cost_per_month_usd = v;
+        }
+        if let Some(v) = tokens_per_hour {
+            entry.manifest.resources.max_llm_tokens_per_hour = v;
+        }
         entry.last_active = chrono::Utc::now();
         Ok(())
     }
@@ -295,6 +393,9 @@ mod tests {
                 workspace: None,
                 generate_identity_files: true,
                 exec_policy: None,
+                tool_allowlist: vec![],
+                tool_blocklist: vec![],
+                cache_context: false,
             },
             state: AgentState::Created,
             mode: AgentMode::default(),
