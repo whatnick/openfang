@@ -23,6 +23,7 @@ use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::llm_driver::StreamEvent;
 use openfang_runtime::llm_errors;
 use openfang_types::agent::AgentId;
+use openfang_types::commands::{self, Surfaces};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
@@ -145,20 +146,48 @@ pub async fn agent_ws(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
-    // SECURITY: Authenticate WebSocket upgrades (bypasses middleware).
-    let api_key = &state.kernel.config.api_key;
-    if !api_key.is_empty() {
+    // SECURITY: Authenticate WebSocket upgrades (bypasses HTTP middleware).
+    // Trim whitespace so empty/whitespace-only api_key still triggers the
+    // fail-closed path for non-loopback origins (see issue #1034 B2).
+    let api_key_raw = &state.kernel.config.api_key;
+    let api_key = api_key_raw.trim();
+    let is_loopback = addr.ip().is_loopback();
+
+    if api_key.is_empty() {
+        // No key configured. Only allow loopback, unless the operator has
+        // explicitly opted in to running open via OPENFANG_ALLOW_NO_AUTH=1.
+        let allow_no_auth = std::env::var("OPENFANG_ALLOW_NO_AUTH")
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false);
+        if !is_loopback && !allow_no_auth {
+            warn!(
+                ip = %addr.ip(),
+                "WebSocket upgrade rejected: no api_key configured and origin is not loopback"
+            );
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    } else {
+        // SECURITY: Use constant-time comparison to prevent timing attacks on API key
+        let ct_eq = |token: &str, key: &str| -> bool {
+            use subtle::ConstantTimeEq;
+            if token.len() != key.len() {
+                return false;
+            }
+            token.as_bytes().ct_eq(key.as_bytes()).into()
+        };
+
         let header_auth = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|token| token == api_key)
+            .map(|token| ct_eq(token, api_key))
             .unwrap_or(false);
 
         let query_auth = uri
             .query()
             .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
-            .map(|token| token == api_key)
+            .map(crate::percent_decode)
+            .map(|token| ct_eq(&token, api_key))
             .unwrap_or(false);
 
         if !header_auth && !query_auth {
@@ -185,9 +214,29 @@ pub async fn agent_ws(
         }
     };
 
-    // Verify agent exists
-    if state.kernel.registry.get(agent_id).is_none() {
-        return axum::http::StatusCode::NOT_FOUND.into_response();
+    // Verify agent exists.
+    // Retry up to 5 times with 200ms backoff to handle a timing race where
+    // the client connects before the agent finishes registering (#804).
+    {
+        let mut found = state.kernel.registry.get(agent_id).is_some();
+        if !found {
+            for attempt in 1..=4 {
+                debug!(
+                    agent_id = %id,
+                    attempt,
+                    "Agent not found yet, retrying in 200ms"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if state.kernel.registry.get(agent_id).is_some() {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            warn!(agent_id = %id, "Agent not found after 5 lookup attempts");
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
     }
 
     let id_str = id.clone();
@@ -428,6 +477,7 @@ async fn handle_text_message(
 
             // Resolve file attachments into image content blocks
             let mut has_images = false;
+            let mut ws_content_blocks: Option<Vec<openfang_types::message::ContentBlock>> = None;
             if let Some(attachments) = parsed["attachments"].as_array() {
                 let refs: Vec<crate::types::AttachmentRef> = attachments
                     .iter()
@@ -437,11 +487,7 @@ async fn handle_text_message(
                     let image_blocks = crate::routes::resolve_attachments(&refs);
                     if !image_blocks.is_empty() {
                         has_images = true;
-                        crate::routes::inject_attachments_into_session(
-                            &state.kernel,
-                            agent_id,
-                            image_blocks,
-                        );
+                        ws_content_blocks = Some(image_blocks);
                     }
                 }
             }
@@ -491,16 +537,30 @@ async fn handle_text_message(
             // Send message to agent with streaming
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
-            match state
-                .kernel
-                .send_message_streaming(agent_id, &content, Some(kernel_handle))
-            {
+            match state.kernel.send_message_streaming(
+                agent_id,
+                &content,
+                Some(kernel_handle),
+                None,
+                None,
+                ws_content_blocks,
+            ) {
                 Ok((mut rx, handle)) => {
-                    // Forward stream events to WebSocket with debouncing
+                    // Forward stream events to WebSocket with debouncing.
+                    //
+                    // The stream_task also accumulates the full response text and
+                    // captures ContentComplete usage data. This lets us send the
+                    // `response` event immediately when the stream channel closes
+                    // (after `drop(phase_cb)` in the kernel), WITHOUT waiting for
+                    // post-processing (canonical session writes, JSONL, compaction)
+                    // that happens in the kernel task after the loop.
                     let sender_stream = Arc::clone(sender);
                     let verbose_clone = Arc::clone(verbose);
                     let stream_task = tokio::spawn(async move {
                         let mut text_buffer = String::new();
+                        let mut accumulated_text = String::new();
+                        let mut stream_usage: Option<openfang_types::message::TokenUsage> = None;
+                        let mut is_silent = false;
                         let far_future = tokio::time::Instant::now() + Duration::from_secs(86400);
                         let mut flush_deadline = far_future;
 
@@ -524,7 +584,15 @@ async fn handle_text_message(
                                             break;
                                         }
                                         Some(ev) => {
+                                            // Capture ContentComplete for immediate response
+                                            if let StreamEvent::ContentComplete { usage, .. } = &ev {
+                                                stream_usage = Some(*usage);
+                                                // Don't forward — handled below
+                                                continue;
+                                            }
+
                                             if let StreamEvent::TextDelta { ref text } = ev {
+                                                accumulated_text.push_str(text);
                                                 text_buffer.push_str(text);
                                                 if text_buffer.len() >= DEBOUNCE_CHARS {
                                                     let _ = flush_text_buffer(
@@ -589,14 +657,62 @@ async fn handle_text_message(
                                 }
                             }
                         }
+
+                        // Check if the agent signalled NO_REPLY via the stream
+                        // (PhaseChange with a "silent" marker — currently the
+                        // kernel sets result.silent after the loop, so we detect
+                        // it from empty accumulated text when ContentComplete
+                        // had no text deltas at all).
+                        if accumulated_text.is_empty() && stream_usage.is_some() {
+                            is_silent = true;
+                        }
+
+                        (accumulated_text, stream_usage, is_silent)
                     });
 
-                    // Wait for the agent loop to complete
-                    match handle.await {
-                        Ok(Ok(result)) => {
-                            // Cancel the stream forwarder (should be done by now)
-                            stream_task.abort();
+                    // Wait for the stream to finish (fast — closes as soon as
+                    // drop(phase_cb) runs after the agent loop). This does NOT
+                    // wait for post-processing.
+                    let stream_result = stream_task.await;
 
+                    // Spawn the kernel task in the background for cleanup
+                    // (canonical session writes, JSONL mirror, compaction).
+                    // We don't need its result for the response event.
+                    let sender_bg = Arc::clone(sender);
+                    tokio::spawn(async move {
+                        match handle.await {
+                            Ok(Err(e)) => {
+                                warn!("Agent post-processing failed: {e}");
+                                let user_msg = classify_streaming_error(&e);
+                                let _ = send_json(
+                                    &sender_bg,
+                                    &serde_json::json!({
+                                        "type": "error",
+                                        "content": user_msg,
+                                    }),
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                warn!("Agent task panicked: {e}");
+                                let _ = send_json(
+                                    &sender_bg,
+                                    &serde_json::json!({
+                                        "type": "error",
+                                        "content": "Internal error occurred",
+                                    }),
+                                )
+                                .await;
+                            }
+                            Ok(Ok(_)) => {
+                                // Post-processing completed successfully — nothing to send
+                            }
+                        }
+                    });
+
+                    // Send the response immediately from stream data
+                    match stream_result {
+                        Ok((accumulated_text, stream_usage, is_silent)) => {
                             // Send typing lifecycle: stop
                             let _ = send_json(
                                 sender,
@@ -607,39 +723,36 @@ async fn handle_text_message(
                             )
                             .await;
 
-                            // NO_REPLY: agent intentionally chose not to reply
-                            if result.silent {
+                            let usage = stream_usage.unwrap_or_default();
+
+                            if is_silent {
                                 let _ = send_json(
                                     sender,
                                     &serde_json::json!({
                                         "type": "silent_complete",
-                                        "input_tokens": result.total_usage.input_tokens,
-                                        "output_tokens": result.total_usage.output_tokens,
+                                        "input_tokens": usage.input_tokens,
+                                        "output_tokens": usage.output_tokens,
                                     }),
                                 )
                                 .await;
                                 return;
                             }
 
-                            // Guard: ensure we never send an empty response
-                            let content = if result.response.trim().is_empty() {
+                            // Strip <think>...</think> blocks
+                            let cleaned = strip_think_tags(&accumulated_text);
+
+                            let content = if cleaned.trim().is_empty() {
                                 format!(
-                                    "[The agent completed processing but returned no text response. ({} in / {} out | {} iter)]",
-                                    result.total_usage.input_tokens,
-                                    result.total_usage.output_tokens,
-                                    result.iterations,
+                                    "[The agent completed processing but returned no text response. ({} in / {} out)]",
+                                    usage.input_tokens, usage.output_tokens,
                                 )
                             } else {
-                                result.response
+                                cleaned
                             };
 
-                            // Estimate context pressure from last call
-                            let per_call = if result.iterations > 0 {
-                                result.total_usage.input_tokens / result.iterations as u64
-                            } else {
-                                result.total_usage.input_tokens
-                            };
-                            let ctx_pct = (per_call as f64 / 200_000.0 * 100.0).min(100.0);
+                            // Estimate context pressure
+                            let ctx_pct =
+                                (usage.input_tokens as f64 / 200_000.0 * 100.0).min(100.0);
                             let pressure = if ctx_pct > 85.0 {
                                 "critical"
                             } else if ctx_pct > 70.0 {
@@ -655,38 +768,17 @@ async fn handle_text_message(
                                 &serde_json::json!({
                                     "type": "response",
                                     "content": content,
-                                    "input_tokens": result.total_usage.input_tokens,
-                                    "output_tokens": result.total_usage.output_tokens,
-                                    "iterations": result.iterations,
-                                    "cost_usd": result.cost_usd,
+                                    "input_tokens": usage.input_tokens,
+                                    "output_tokens": usage.output_tokens,
+                                    "iterations": 0, // Not available from stream; handle updates later if needed
+                                    "cost_usd": null,
                                     "context_pressure": pressure,
                                 }),
                             )
                             .await;
                         }
-                        Ok(Err(e)) => {
-                            stream_task.abort();
-                            warn!("Agent message failed: {e}");
-                            let _ = send_json(
-                                sender,
-                                &serde_json::json!({
-                                    "type": "typing", "state": "stop",
-                                }),
-                            )
-                            .await;
-                            let user_msg = classify_streaming_error(&e);
-                            let _ = send_json(
-                                sender,
-                                &serde_json::json!({
-                                    "type": "error",
-                                    "content": user_msg,
-                                }),
-                            )
-                            .await;
-                        }
                         Err(e) => {
-                            stream_task.abort();
-                            warn!("Agent task panicked: {e}");
+                            warn!("Stream task panicked: {e}");
                             let _ = send_json(
                                 sender,
                                 &serde_json::json!({
@@ -762,8 +854,17 @@ async fn handle_command(
     args: &str,
     verbose: &Arc<AtomicU8>,
 ) -> serde_json::Value {
-    match cmd {
-        "new" | "reset" => match state.kernel.reset_session(agent_id) {
+    // Canonicalise through the unified command registry. This resolves aliases
+    // (e.g. `reset` -> `new`) and is case-insensitive. If the command is not
+    // registered on the WEB surface, fall through to the existing match so any
+    // legacy/un-registered handlers still work byte-identically.
+    let canonical: &str = commands::resolve(cmd)
+        .filter(|def| def.surfaces.contains(Surfaces::WEB))
+        .map(|def| def.name)
+        .unwrap_or(cmd);
+
+    match canonical {
+        "new" => match state.kernel.reset_session(agent_id) {
             Ok(()) => {
                 serde_json::json!({"type": "command_result", "command": cmd, "message": "Session reset. Chat history cleared."})
             }
@@ -794,9 +895,21 @@ async fn handle_command(
                     serde_json::json!({"type": "error", "content": "Agent not found"})
                 }
             } else {
-                match state.kernel.set_agent_model(agent_id, args) {
+                match state.kernel.set_agent_model(agent_id, args, None) {
                     Ok(()) => {
-                        serde_json::json!({"type": "command_result", "command": cmd, "message": format!("Model switched to: {args}")})
+                        if let Some(entry) = state.kernel.registry.get(agent_id) {
+                            let model = &entry.manifest.model.model;
+                            let provider = &entry.manifest.model.provider;
+                            serde_json::json!({
+                                "type": "command_result",
+                                "command": cmd,
+                                "message": format!("Model switched to: {model} (provider: {provider})"),
+                                "model": model,
+                                "provider": provider
+                            })
+                        } else {
+                            serde_json::json!({"type": "command_result", "command": cmd, "message": format!("Model switched to: {args}")})
+                        }
                     }
                     Err(e) => {
                         serde_json::json!({"type": "error", "content": format!("Model switch failed: {e}")})
@@ -885,7 +998,7 @@ async fn handle_command(
             let msg = if !state.kernel.config.network_enabled {
                 "OFP network disabled.".to_string()
             } else {
-                match &state.kernel.peer_registry {
+                match state.kernel.peer_registry.get() {
                     Some(registry) => {
                         let peers = registry.all_peers();
                         if peers.is_empty() {
@@ -920,7 +1033,20 @@ async fn handle_command(
             };
             serde_json::json!({"type": "command_result", "command": cmd, "message": msg})
         }
-        _ => serde_json::json!({"type": "error", "content": format!("Unknown command: {cmd}")}),
+        "help" => {
+            serde_json::json!({
+                "type": "command_result",
+                "command": cmd,
+                "message": commands::render_help(Surfaces::WEB),
+            })
+        }
+        _ => serde_json::json!({
+            "type": "error",
+            "content": format!(
+                "Unknown command: /{cmd}\n\n{}",
+                commands::render_help(Surfaces::WEB)
+            ),
+        }),
     }
 }
 
@@ -932,11 +1058,14 @@ async fn handle_command(
 fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_json::Value> {
     match event {
         StreamEvent::TextDelta { .. } => None, // Handled by debounce buffer
-        StreamEvent::ToolUseStart { name, .. } => Some(serde_json::json!({
+        StreamEvent::ToolUseStart { id, name, .. } => Some(serde_json::json!({
             "type": "tool_start",
+            "id": id,
             "tool": name,
         })),
-        StreamEvent::ToolUseEnd { name, input, .. } if name == "canvas_present" => {
+        StreamEvent::ToolUseEnd {
+            id, name, input, ..
+        } if name == "canvas_present" => {
             let html = input.get("html").and_then(|v| v.as_str()).unwrap_or("");
             let title = input
                 .get("title")
@@ -944,12 +1073,15 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 .unwrap_or("Canvas");
             Some(serde_json::json!({
                 "type": "canvas",
+                "id": id,
                 "canvas_id": uuid::Uuid::new_v4().to_string(),
                 "html": html,
                 "title": title,
             }))
         }
-        StreamEvent::ToolUseEnd { name, input, .. } => match verbose {
+        StreamEvent::ToolUseEnd {
+            id, name, input, ..
+        } => match verbose {
             VerboseLevel::Off => None,
             VerboseLevel::On => {
                 let input_preview: String = serde_json::to_string(input)
@@ -959,6 +1091,7 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                     .collect();
                 Some(serde_json::json!({
                     "type": "tool_end",
+                    "id": id,
                     "tool": name,
                     "input": input_preview,
                 }))
@@ -971,18 +1104,21 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                     .collect();
                 Some(serde_json::json!({
                     "type": "tool_end",
+                    "id": id,
                     "tool": name,
                     "input": input_preview,
                 }))
             }
         },
         StreamEvent::ToolExecutionResult {
+            id,
             name,
             result_preview,
             is_error,
         } => match verbose {
             VerboseLevel::Off => Some(serde_json::json!({
                 "type": "tool_result",
+                "id": id,
                 "tool": name,
                 "is_error": is_error,
             })),
@@ -990,6 +1126,7 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 let truncated: String = result_preview.chars().take(200).collect();
                 Some(serde_json::json!({
                     "type": "tool_result",
+                    "id": id,
                     "tool": name,
                     "result": truncated,
                     "is_error": is_error,
@@ -997,6 +1134,7 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             }
             VerboseLevel::Full => Some(serde_json::json!({
                 "type": "tool_result",
+                "id": id,
                 "tool": name,
                 "result": result_preview,
                 "is_error": is_error,
@@ -1092,6 +1230,9 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
     let status = extract_status_code(&inner);
     let classified = llm_errors::classify_error(&inner, status);
 
+    // Build a user-facing message. The classified.sanitized_message now
+    // includes a redacted excerpt of the raw error (issue #493 fix), so we
+    // use it as the base and only override for cases that need extra context.
     match classified.category {
         llm_errors::LlmErrorCategory::ContextOverflow => {
             "Context is full. Try /compact or /new.".to_string()
@@ -1099,20 +1240,36 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
         llm_errors::LlmErrorCategory::RateLimit => {
             if let Some(delay_ms) = classified.suggested_delay_ms {
                 let secs = (delay_ms / 1000).max(1);
-                format!("Provider rate limited. Wait ~{secs}s and try again.")
+                format!("Rate limited. Wait ~{secs}s and try again.")
             } else {
-                "Provider rate limited. Wait a moment and try again.".to_string()
+                "Rate limited. Wait a moment and try again.".to_string()
             }
         }
         llm_errors::LlmErrorCategory::Billing => {
-            "Check provider account status (billing issue detected).".to_string()
+            format!("Billing issue. {}", classified.sanitized_message)
         }
-        llm_errors::LlmErrorCategory::Auth => "Verify your API key in config.".to_string(),
+        llm_errors::LlmErrorCategory::Auth => {
+            // Show the actual error detail so users can diagnose (issue #493).
+            // The sanitized_message already redacts secrets.
+            classified.sanitized_message.clone()
+        }
         llm_errors::LlmErrorCategory::ModelNotFound => {
-            "Model unavailable. Use /model to see options.".to_string()
+            if inner.contains("localhost:11434") || inner.contains("ollama") {
+                "Model not found on Ollama. Run `ollama pull <model>` first. Use /model to see options.".to_string()
+            } else {
+                format!(
+                    "{}. Use /model to see options.",
+                    classified.sanitized_message
+                )
+            }
         }
         llm_errors::LlmErrorCategory::Format => {
-            "LLM request failed. Check your API key and model configuration in Settings.".to_string()
+            // Claude Code CLI errors have actionable messages — pass them through
+            if inner.contains("Claude Code CLI") || inner.contains("claude auth") {
+                classified.raw_message.clone()
+            } else {
+                classified.sanitized_message.clone()
+            }
         }
         _ => classified.sanitized_message,
     }
@@ -1120,6 +1277,14 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
 
 /// Try to extract an HTTP status code from an error string.
 fn extract_status_code(s: &str) -> Option<u16> {
+    // "API error (NNN):" — the format produced by LlmError::Api Display impl
+    if let Some(idx) = s.find("API error (") {
+        let after = &s[idx + 11..];
+        let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(code) = num.parse::<u16>() {
+            return Some(code);
+        }
+    }
     // "status: NNN"
     if let Some(idx) = s.find("status: ") {
         let after = &s[idx + 8..];
@@ -1145,6 +1310,27 @@ fn extract_status_code(s: &str) -> Option<u16> {
         }
     }
     None
+}
+
+/// Strip `<think>...</think>` blocks from model output.
+///
+/// Some models (MiniMax, DeepSeek, etc.) wrap their reasoning in `<think>` tags.
+/// These are internal chain-of-thought and shouldn't be shown to the user.
+pub fn strip_think_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<think>") {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find("</think>") {
+            remaining = &remaining[(start + end + 8)..]; // 8 = "</think>".len()
+        } else {
+            // Unclosed <think> tag — strip to end
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,10 +1403,33 @@ mod tests {
         );
         assert_eq!(extract_status_code("StatusCode(401)"), Some(401));
         assert_eq!(extract_status_code("some random error"), None);
+        // LlmError::Api Display format (issue #493 fix)
+        assert_eq!(
+            extract_status_code("LLM driver error: API error (403): quota exceeded"),
+            Some(403)
+        );
+        assert_eq!(
+            extract_status_code("API error (401): invalid api key"),
+            Some(401)
+        );
     }
 
     #[test]
     fn test_sanitize_trims_whitespace() {
         assert_eq!(sanitize_user_input("  hello  "), "hello");
+    }
+
+    #[test]
+    fn test_strip_think_tags() {
+        assert_eq!(
+            strip_think_tags("<think>reasoning here</think>The answer is 42."),
+            "The answer is 42."
+        );
+        assert_eq!(
+            strip_think_tags("Hello <think>\nsome thinking\n</think> world"),
+            "Hello  world"
+        );
+        assert_eq!(strip_think_tags("No thinking here"), "No thinking here");
+        assert_eq!(strip_think_tags("<think>all thinking</think>"), "");
     }
 }

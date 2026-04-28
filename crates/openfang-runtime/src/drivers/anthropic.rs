@@ -27,7 +27,10 @@ impl AnthropicDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .user_agent(crate::USER_AGENT)
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -365,10 +368,10 @@ impl LlmDriver for AnthropicDriver {
                     let mut event_type = String::new();
                     let mut data = String::new();
                     for line in event_text.lines() {
-                        if let Some(et) = line.strip_prefix("event: ") {
-                            event_type = et.to_string();
-                        } else if let Some(d) = line.strip_prefix("data: ") {
-                            data = d.to_string();
+                        if let Some(et) = line.strip_prefix("event:") {
+                            event_type = et.trim_start().to_string();
+                        } else if let Some(d) = line.strip_prefix("data:") {
+                            data = d.trim_start().to_string();
                         }
                     }
 
@@ -415,12 +418,13 @@ impl LlmDriver for AnthropicDriver {
                             }
                         }
                         "content_block_delta" => {
+                            let block_idx = json["index"].as_u64().unwrap_or(0) as usize;
                             let delta = &json["delta"];
                             match delta["type"].as_str().unwrap_or("") {
                                 "text_delta" => {
                                     if let Some(text) = delta["text"].as_str() {
                                         if let Some(ContentBlockAccum::Text(ref mut t)) =
-                                            blocks.last_mut()
+                                            blocks.get_mut(block_idx)
                                         {
                                             t.push_str(text);
                                         }
@@ -436,7 +440,7 @@ impl LlmDriver for AnthropicDriver {
                                         if let Some(ContentBlockAccum::ToolUse {
                                             ref mut input_json,
                                             ..
-                                        }) = blocks.last_mut()
+                                        }) = blocks.get_mut(block_idx)
                                         {
                                             input_json.push_str(partial);
                                         }
@@ -450,7 +454,7 @@ impl LlmDriver for AnthropicDriver {
                                 "thinking_delta" => {
                                     if let Some(thinking) = delta["thinking"].as_str() {
                                         if let Some(ContentBlockAccum::Thinking(ref mut t)) =
-                                            blocks.last_mut()
+                                            blocks.get_mut(block_idx)
                                         {
                                             t.push_str(thinking);
                                         }
@@ -460,14 +464,15 @@ impl LlmDriver for AnthropicDriver {
                             }
                         }
                         "content_block_stop" => {
+                            let block_idx = json["index"].as_u64().unwrap_or(0) as usize;
                             if let Some(ContentBlockAccum::ToolUse {
                                 id,
                                 name,
                                 input_json,
-                            }) = blocks.last()
+                            }) = blocks.get(block_idx)
                             {
-                                let input: serde_json::Value =
-                                    serde_json::from_str(input_json).unwrap_or_default();
+                                let input: serde_json::Value = serde_json::from_str(input_json)
+                                    .unwrap_or_else(|_| serde_json::json!({}));
                                 let _ = tx
                                     .send(StreamEvent::ToolUseEnd {
                                         id: id.clone(),
@@ -502,7 +507,10 @@ impl LlmDriver for AnthropicDriver {
             for block in blocks {
                 match block {
                     ContentBlockAccum::Text(text) => {
-                        content.push(ContentBlock::Text { text });
+                        content.push(ContentBlock::Text {
+                            text,
+                            provider_metadata: None,
+                        });
                     }
                     ContentBlockAccum::Thinking(thinking) => {
                         content.push(ContentBlock::Thinking { thinking });
@@ -512,12 +520,13 @@ impl LlmDriver for AnthropicDriver {
                         name,
                         input_json,
                     } => {
-                        let input: serde_json::Value =
-                            serde_json::from_str(&input_json).unwrap_or_default();
+                        let input: serde_json::Value = serde_json::from_str(&input_json)
+                            .unwrap_or_else(|_| serde_json::json!({}));
                         content.push(ContentBlock::ToolUse {
                             id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
+                            provider_metadata: None,
                         });
                         tool_calls.push(ToolCall { id, name, input });
                     }
@@ -543,6 +552,28 @@ impl LlmDriver for AnthropicDriver {
     }
 }
 
+/// Ensure a `serde_json::Value` is a JSON object (dictionary).
+///
+/// The Anthropic API requires `tool_use.input` to be a JSON object, never a
+/// string, null, or other scalar.  This helper handles:
+///  - `Value::Object` → returned as-is
+///  - `Value::String` → attempt to parse as JSON; if the result is an object, use it
+///  - anything else (Null, Number, Bool, Array) → empty object `{}`
+fn ensure_object(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(_) => v.clone(),
+        serde_json::Value::String(s) => {
+            // The input may have been double-serialized (stored as a JSON string).
+            // Try to parse it back into a Value.
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(parsed) if parsed.is_object() => parsed,
+                _ => serde_json::json!({}),
+            }
+        }
+        _ => serde_json::json!({}),
+    }
+}
+
 /// Convert an OpenFang Message to an Anthropic API message.
 fn convert_message(msg: &Message) -> ApiMessage {
     let role = match msg.role {
@@ -557,7 +588,7 @@ fn convert_message(msg: &Message) -> ApiMessage {
             let api_blocks: Vec<ApiContentBlock> = blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
+                    ContentBlock::Text { text, .. } => {
                         Some(ApiContentBlock::Text { text: text.clone() })
                     }
                     ContentBlock::Image { media_type, data } => Some(ApiContentBlock::Image {
@@ -567,15 +598,18 @@ fn convert_message(msg: &Message) -> ApiMessage {
                             data: data.clone(),
                         },
                     }),
-                    ContentBlock::ToolUse { id, name, input } => Some(ApiContentBlock::ToolUse {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => Some(ApiContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
-                        input: input.clone(),
+                        input: ensure_object(input),
                     }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         content,
                         is_error,
+                        ..
                     } => Some(ApiContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: content.clone(),
@@ -603,13 +637,17 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
     for block in api.content {
         match block {
             ResponseContentBlock::Text { text } => {
-                content.push(ContentBlock::Text { text });
+                content.push(ContentBlock::Text {
+                    text,
+                    provider_metadata: None,
+                });
             }
             ResponseContentBlock::ToolUse { id, name, input } => {
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    provider_metadata: None,
                 });
                 tool_calls.push(ToolCall { id, name, input });
             }
@@ -674,5 +712,64 @@ mod tests {
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "web_search");
         assert_eq!(response.usage.total(), 150);
+    }
+
+    #[test]
+    fn test_ensure_object_from_object() {
+        let obj = serde_json::json!({"key": "value"});
+        assert_eq!(ensure_object(&obj), obj);
+    }
+
+    #[test]
+    fn test_ensure_object_from_string() {
+        // Simulates double-serialized input (stored as JSON string)
+        let stringified = serde_json::Value::String(r#"{"query": "rust"}"#.to_string());
+        let result = ensure_object(&stringified);
+        assert_eq!(result, serde_json::json!({"query": "rust"}));
+    }
+
+    #[test]
+    fn test_ensure_object_from_null() {
+        let null = serde_json::Value::Null;
+        assert_eq!(ensure_object(&null), serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_ensure_object_from_non_object_string() {
+        // A string that parses to a non-object JSON value
+        let s = serde_json::Value::String("42".to_string());
+        assert_eq!(ensure_object(&s), serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_ensure_object_from_invalid_json_string() {
+        let s = serde_json::Value::String("not json at all".to_string());
+        assert_eq!(ensure_object(&s), serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_convert_message_normalizes_tool_input() {
+        // Simulate a ToolUse block with a stringified JSON input (legacy session data)
+        let msg = Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::Value::String(r#"{"query": "test"}"#.to_string()),
+                provider_metadata: None,
+            }]),
+        };
+        let api_msg = convert_message(&msg);
+        if let ApiContent::Blocks(blocks) = api_msg.content {
+            match &blocks[0] {
+                ApiContentBlock::ToolUse { input, .. } => {
+                    assert!(input.is_object(), "input should be an object, got: {input}");
+                    assert_eq!(input["query"], "test");
+                }
+                _ => panic!("Expected ToolUse block"),
+            }
+        } else {
+            panic!("Expected Blocks content");
+        }
     }
 }
