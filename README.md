@@ -448,6 +448,13 @@ openfang start
 # Build the workspace
 cargo build --workspace --lib
 
+# Cross-compile the CLI for Raspberry Pi OS 64-bit (Pi 4/5)
+cargo install cross --locked
+cross build --release -p openfang-cli --bin openfang --target aarch64-unknown-linux-gnu
+
+# Cross-compile the CLI for Raspberry Pi OS 32-bit
+cross build --release -p openfang-cli --bin openfang --target armv7-unknown-linux-gnueabihf
+
 # Run all tests (1,767+)
 cargo test --workspace
 

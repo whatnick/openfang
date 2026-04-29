@@ -36,6 +36,7 @@ roxmltree = "0.21"
 
 lettre = { workspace = true }
 imap = { workspace = true }
+native-tls = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pki-types = { workspace = true }

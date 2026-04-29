@@ -60,6 +60,27 @@ cd openfang
 cargo install --path crates/openfang-cli
 ```
 
+### Raspberry Pi Builds
+
+For Raspberry Pi OS, use the prebuilt release binary when possible:
+
+- 64-bit Raspberry Pi OS: `aarch64-unknown-linux-gnu`
+- 32-bit Raspberry Pi OS: `armv7-unknown-linux-gnueabihf`
+
+To build on another machine and cross-compile for Pi:
+
+```bash
+cargo install cross --locked
+
+# Raspberry Pi OS 64-bit (Pi 4/5)
+cross build --release -p openfang-cli --bin openfang --target aarch64-unknown-linux-gnu
+
+# Raspberry Pi OS 32-bit
+cross build --release -p openfang-cli --bin openfang --target armv7-unknown-linux-gnueabihf
+```
+
+The resulting binary will be placed under `target/<target-triple>/release/openfang`.
+
 ### Option 5: Docker
 
 ```bash
